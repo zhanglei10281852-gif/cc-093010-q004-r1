@@ -10,6 +10,10 @@ from app.pilots.repository import PilotRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.database import get_connection, transaction
+from app.services.audit import AuditContext, AuditService
+
+IDEMPOTENCY_SCOPE = "project"
+IDEMPOTENCY_SCOPE_FIELDS = ("project_code", "requested_by", "idempotency_key")
 
 
 def digest(value: Any) -> str:
@@ -50,34 +54,142 @@ class PilotOperationsService:
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
+        rejection: ConflictError | None = None
         with transaction(immediate=True) as connection:
             repository = PilotRepository(connection)
+            audit = AuditService(connection, self.clock)
             protocol = repository.protocol_by_code(payload["protocol_code"])
             if protocol is None or not protocol["active"]:
                 raise NotFoundError("参数方案不存在或已经停用")
             parameters = self._validate_parameters(protocol, payload["parameters"])
-            existing = repository.session_by_idempotency(payload["requested_by"], payload["idempotency_key"])
             parameter_digest = digest(parameters)
+            priority = int(payload["priority"])
+            scope_context = self._scope_context(payload["project_code"], payload["requested_by"], payload["idempotency_key"])
+
+            existing = repository.session_by_idempotency(payload["project_code"], payload["requested_by"], payload["idempotency_key"])
             if existing is not None:
-                if existing["parameter_digest"] != parameter_digest:
-                    raise ConflictError("同一幂等键对应了不同的试点参数")
-                return dict(repository.session_by_id(existing["id"]))
-            self._check_quota(repository, payload["requested_by"], now_value)
-            return repository.create_session(
-                protocol_id=protocol["id"], project_code=payload["project_code"],
-                requested_by=payload["requested_by"], parameters=parameters,
-                parameter_digest=parameter_digest, priority=payload["priority"],
-                idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"], now=now,
-            )
+                mismatched = self._mismatched_fields(repository, existing, protocol["id"], parameter_digest, priority)
+                if mismatched:
+                    rejection = self._reject_replay(audit, payload, existing, mismatched, scope_context)
+                else:
+                    self._audit_replay(audit, payload, existing, scope_context)
+                    return self._present(repository, existing["id"])
+            else:
+                self._check_quota(repository, payload["requested_by"], now_value)
+                try:
+                    created = repository.create_session(
+                        protocol_id=protocol["id"], project_code=payload["project_code"],
+                        requested_by=payload["requested_by"], parameters=parameters,
+                        parameter_digest=parameter_digest, priority=priority,
+                        idempotency_key=payload["idempotency_key"], idempotency_scope=IDEMPOTENCY_SCOPE,
+                        max_attempts=protocol["max_attempts"], now=now,
+                    )
+                except sqlite3.IntegrityError:
+                    # 并发首次提交：唯一作用域约束保证只有一条落库，落败方按重放处理。
+                    existing = repository.session_by_idempotency(payload["project_code"], payload["requested_by"], payload["idempotency_key"])
+                    if existing is None:
+                        raise
+                    mismatched = self._mismatched_fields(repository, existing, protocol["id"], parameter_digest, priority)
+                    if mismatched:
+                        rejection = self._reject_replay(audit, payload, existing, mismatched, scope_context)
+                    else:
+                        self._audit_replay(audit, payload, existing, scope_context)
+                        return self._present(repository, existing["id"])
+                else:
+                    self._audit_created(audit, payload, created, scope_context)
+                    return self._with_scope(created)
+        # 拒绝事件已随事务提交持久化，再向调用方返回 409。
+        raise rejection
+
+    @staticmethod
+    def _scope_context(project_code: str, requested_by: str, key: str) -> dict[str, Any]:
+        return {
+            "scope": IDEMPOTENCY_SCOPE,
+            "fields": list(IDEMPOTENCY_SCOPE_FIELDS),
+            "project_code": project_code,
+            "requested_by": requested_by,
+            "idempotency_key": key,
+        }
+
+    def _mismatched_fields(self, repository: PilotRepository, existing: sqlite3.Row, protocol_id: int, parameter_digest: str, priority: int) -> dict[str, Any]:
+        differences: dict[str, Any] = {}
+        if int(existing["protocol_id"]) != int(protocol_id):
+            stored_protocol = repository.protocol_by_id(int(existing["protocol_id"]))
+            differences["protocol_code"] = {
+                "existing": stored_protocol["code"] if stored_protocol is not None else None,
+            }
+        if existing["parameter_digest"] != parameter_digest:
+            differences["parameters"] = {
+                "existing_digest": existing["parameter_digest"],
+                "submitted_digest": parameter_digest,
+            }
+        if int(existing["priority"]) != int(priority):
+            differences["priority"] = {"existing": int(existing["priority"]), "submitted": int(priority)}
+        return differences
+
+    def _reject_replay(self, audit: AuditService, payload: dict[str, Any], existing: sqlite3.Row, mismatched: dict[str, Any], scope_context: dict[str, Any]) -> ConflictError:
+        labels = {"protocol_code": "参数方案", "parameters": "试点参数", "priority": "优先级"}
+        names = "、".join(labels[field] for field in mismatched)
+        audit.record(
+            AuditContext(None, payload["requested_by"]),
+            action="pilot_session.submit_rejected",
+            resource_type="pilot_session",
+            resource_id=existing["id"],
+            outcome="denied",
+            after={"mismatched_fields": mismatched},
+            metadata={"idempotency_scope": scope_context, "mismatched_fields": sorted(mismatched)},
+        )
+        return ConflictError(
+            f"同一幂等键在当前项目作用域内已对应不同的{names}，禁止静默复用",
+            context={"idempotency_scope": scope_context, "mismatched_fields": mismatched},
+        )
+
+    def _audit_replay(self, audit: AuditService, payload: dict[str, Any], existing: sqlite3.Row, scope_context: dict[str, Any]) -> None:
+        audit.record(
+            AuditContext(None, payload["requested_by"]),
+            action="pilot_session.replay",
+            resource_type="pilot_session",
+            resource_id=existing["id"],
+            outcome="success",
+            metadata={"idempotency_scope": scope_context, "replayed": True},
+        )
+
+    def _audit_created(self, audit: AuditService, payload: dict[str, Any], created: dict[str, Any], scope_context: dict[str, Any]) -> None:
+        audit.record(
+            AuditContext(None, payload["requested_by"]),
+            action="pilot_session.submit",
+            resource_type="pilot_session",
+            resource_id=created["id"],
+            outcome="success",
+            after={
+                "id": created["id"],
+                "project_code": created["project_code"],
+                "protocol_code": created.get("protocol_code"),
+                "status": created["status"],
+            },
+            metadata={"idempotency_scope": scope_context},
+        )
+
+    def _present(self, repository: PilotRepository, session_id: int) -> dict[str, Any]:
+        row = repository.session_by_id(session_id)
+        return self._with_scope(dict(row))
+
+    @staticmethod
+    def _with_scope(session: dict[str, Any]) -> dict[str, Any]:
+        session["idempotency_scope_detail"] = PilotOperationsService._scope_context(
+            session["project_code"], session["requested_by"], session["idempotency_key"]
+        )
+        return session
 
     def list_sessions(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        return self.repository.list_sessions(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))
+        items = self.repository.list_sessions(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))
+        return [self._with_scope(item) for item in items]
 
     def get_session(self, session_id: int) -> dict[str, Any]:
         row = self.repository.session_by_id(session_id)
         if row is None:
             raise NotFoundError("试点体验场次不存在")
-        observation = dict(row)
+        observation = self._with_scope(dict(row))
         observation["observations"] = self.repository.observation_versions(session_id)
         observation["interventions"] = self.repository.interventions(session_id)
         return observation

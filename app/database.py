@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -10,8 +12,45 @@ from typing import Iterator
 from app.core.clock import to_storage, utc_now
 
 
+SCHEMA_VERSION = 3
+
+
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "health-innovation.db"
 _local = threading.local()
+
+
+_PILOT_SESSIONS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS pilot_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol_id INTEGER NOT NULL REFERENCES pilot_protocols(id) ON DELETE RESTRICT,
+    project_code TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    parameter_digest TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+    idempotency_key TEXT NOT NULL,
+    idempotency_scope TEXT NOT NULL DEFAULT 'project',
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    current_observation_version INTEGER,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(project_code, requested_by, idempotency_key)
+)
+""".strip()
+_PILOT_SESSIONS_SUBMITTER_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_pilot_sessions_submitter "
+    "ON pilot_sessions(requested_by,idempotency_key)"
+)
 
 
 SCHEMA = r'''
@@ -217,31 +256,8 @@ CREATE TABLE IF NOT EXISTS pilot_quotas (
     updated_at TEXT NOT NULL,
     UNIQUE(subject_type, subject_key)
 );
-CREATE TABLE IF NOT EXISTS pilot_sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    protocol_id INTEGER NOT NULL REFERENCES pilot_protocols(id) ON DELETE RESTRICT,
-    project_code TEXT NOT NULL,
-    requested_by TEXT NOT NULL,
-    parameters_json TEXT NOT NULL,
-    parameter_digest TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
-    idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
-    available_at TEXT NOT NULL,
-    lease_owner TEXT NOT NULL DEFAULT '',
-    lease_expires_at TEXT NOT NULL DEFAULT '',
-    current_observation_version INTEGER,
-    last_error_code TEXT NOT NULL DEFAULT '',
-    last_error_message TEXT NOT NULL DEFAULT '',
-    version INTEGER NOT NULL DEFAULT 1,
-    started_at TEXT,
-    finished_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(requested_by, idempotency_key)
-);
+/*__PILOT_SESSIONS_DDL__*/;
+/*__PILOT_SESSIONS_SUBMITTER_INDEX_DDL__*/;
 CREATE INDEX IF NOT EXISTS idx_pilot_queue ON pilot_sessions(status,priority DESC,available_at,created_at);
 CREATE TABLE IF NOT EXISTS pilot_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,6 +283,12 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
 '''
+
+SCHEMA = (
+    SCHEMA
+    .replace("/*__PILOT_SESSIONS_DDL__*/", _PILOT_SESSIONS_TABLE_DDL)
+    .replace("/*__PILOT_SESSIONS_SUBMITTER_INDEX_DDL__*/", _PILOT_SESSIONS_SUBMITTER_INDEX_DDL)
+)
 
 
 PERMISSIONS = [
@@ -332,9 +354,11 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
 
 def init_db() -> None:
     now = to_storage(utc_now())
+    connection = get_connection()
+    connection.executescript(SCHEMA)
+    _migrate_pilot_idempotency_scope(connection)
     with transaction(immediate=True) as connection:
-        connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -356,6 +380,49 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+
+
+def _migrate_pilot_idempotency_scope(connection: sqlite3.Connection) -> None:
+    """将场次幂等边界由(提交方,键)升级为(项目,提交方,键)。
+
+    历史行的实际作用域标记为 'project'；SQLite 无法直接修改 UNIQUE 约束，
+    按官方表重建流程（临时关闭 foreign_keys、新表拷数、换名）保留 id、
+    观察记录、干预记录与外键定义。
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(pilot_sessions)").fetchall()}
+    if not columns or "idempotency_scope" in columns:
+        return
+    # PRAGMA foreign_keys 不能在事务内切换；连接为 autocommit(isolation_level=None)。
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(_PILOT_SESSIONS_TABLE_DDL.replace("pilot_sessions", "pilot_sessions_v3", 1))
+            connection.execute(
+                "INSERT INTO pilot_sessions_v3("
+                "id,protocol_id,project_code,requested_by,parameters_json,parameter_digest,priority,"
+                "idempotency_key,idempotency_scope,status,attempt_count,max_attempts,available_at,"
+                "lease_owner,lease_expires_at,current_observation_version,last_error_code,last_error_message,"
+                "version,started_at,finished_at,created_at,updated_at) "
+                "SELECT id,protocol_id,project_code,requested_by,parameters_json,parameter_digest,priority,"
+                "idempotency_key,'project',status,attempt_count,max_attempts,available_at,"
+                "lease_owner,lease_expires_at,current_observation_version,last_error_code,last_error_message,"
+                "version,started_at,finished_at,created_at,updated_at FROM pilot_sessions"
+            )
+            connection.execute("DROP TABLE pilot_sessions")
+            connection.execute("ALTER TABLE pilot_sessions_v3 RENAME TO pilot_sessions")
+            connection.execute(_PILOT_SESSIONS_SUBMITTER_INDEX_DDL)
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_queue ON pilot_sessions(status,priority DESC,available_at,created_at)")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+        else:
+            connection.execute("COMMIT")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"幂等作用域迁移后存在外键违规: {violations[:5]}")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 def migrate_db() -> None:
