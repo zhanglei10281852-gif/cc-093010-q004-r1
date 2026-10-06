@@ -9,12 +9,22 @@ from typing import Any, Callable
 from app.pilots.repository import PilotRepository
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
-from app.database import get_connection, transaction
+from app.database import PROJECT_SCOPE, get_connection, session_request_digest, transaction
+from app.services.audit import AuditContext, AuditService
 
 
 def digest(value: Any) -> str:
     text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+class _ReplayConflict(Exception):
+    """同一幂等作用域内业务含义不一致，携带拒绝审计所需上下文。"""
+
+    def __init__(self, session_id: int, differences: list[str]) -> None:
+        super().__init__("idempotency replay conflict")
+        self.session_id = session_id
+        self.differences = differences
 
 
 class PilotOperationsService:
@@ -24,6 +34,7 @@ class PilotOperationsService:
         self.connection = connection or get_connection()
         self.clock = clock or SystemClock()
         self.repository = PilotRepository(self.connection)
+        self.audit = AuditService(self.connection, self.clock)
 
     def list_protocols(self) -> list[dict[str, Any]]:
         return self.repository.active_protocols()
@@ -50,25 +61,111 @@ class PilotOperationsService:
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         now_value = self.clock.now()
         now = to_storage(now_value)
-        with transaction(immediate=True) as connection:
-            repository = PilotRepository(connection)
-            protocol = repository.protocol_by_code(payload["protocol_code"])
-            if protocol is None or not protocol["active"]:
-                raise NotFoundError("参数方案不存在或已经停用")
-            parameters = self._validate_parameters(protocol, payload["parameters"])
-            existing = repository.session_by_idempotency(payload["requested_by"], payload["idempotency_key"])
-            parameter_digest = digest(parameters)
-            if existing is not None:
-                if existing["parameter_digest"] != parameter_digest:
-                    raise ConflictError("同一幂等键对应了不同的试点参数")
-                return dict(repository.session_by_id(existing["id"]))
-            self._check_quota(repository, payload["requested_by"], now_value)
-            return repository.create_session(
-                protocol_id=protocol["id"], project_code=payload["project_code"],
-                requested_by=payload["requested_by"], parameters=parameters,
-                parameter_digest=parameter_digest, priority=payload["priority"],
-                idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"], now=now,
+        project_code = payload["project_code"]
+        requested_by = payload["requested_by"]
+        key = payload["idempotency_key"]
+        try:
+            with transaction(immediate=True) as connection:
+                repository = PilotRepository(connection)
+                protocol = repository.protocol_by_code(payload["protocol_code"])
+                if protocol is None or not protocol["active"]:
+                    raise NotFoundError("参数方案不存在或已经停用")
+                parameters = self._validate_parameters(protocol, payload["parameters"])
+                priority = int(payload["priority"])
+                parameter_digest = digest(parameters)
+                request_digest = session_request_digest(protocol["code"], parameters, priority)
+                existing = repository.session_by_idempotency(project_code, requested_by, key)
+                if existing is not None:
+                    if existing["request_digest"] != request_digest:
+                        raise _ReplayConflict(int(existing["id"]), self._request_differences(existing, protocol, parameters, priority))
+                    session = dict(repository.session_by_id(existing["id"]))
+                    self._record_submission_audit(
+                        requested_by, project_code, key, session["id"],
+                        outcome="success", result="replayed",
+                    )
+                    return session
+                self._check_quota(repository, requested_by, now_value)
+                try:
+                    session = repository.create_session(
+                        protocol_id=protocol["id"], project_code=project_code,
+                        requested_by=requested_by, parameters=parameters,
+                        parameter_digest=parameter_digest, request_digest=request_digest,
+                        idempotency_scope=PROJECT_SCOPE, priority=priority,
+                        idempotency_key=key, max_attempts=protocol["max_attempts"], now=now,
+                    )
+                except sqlite3.IntegrityError:
+                    # 并发首次提交：另一事务已抢先插入，重放其结果，保证只落一条
+                    raced = repository.session_by_idempotency(project_code, requested_by, key)
+                    if raced is None or raced["request_digest"] != request_digest:
+                        raise ConflictError("同一幂等键存在并发冲突，请按原请求重放")
+                    session = dict(repository.session_by_id(raced["id"]))
+                    self._record_submission_audit(
+                        requested_by, project_code, key, session["id"],
+                        outcome="success", result="replayed",
+                    )
+                    return session
+                self._record_submission_audit(
+                    requested_by, project_code, key, session["id"],
+                    outcome="success", result="created",
+                )
+                return session
+        except _ReplayConflict as conflict:
+            # 拒绝发生在业务事务回滚之后，审计仍需独立落库
+            self._record_submission_audit(
+                requested_by, project_code, key, conflict.session_id,
+                outcome="failure", result="rejected_conflict",
+                extra={"differences": conflict.differences},
             )
+            raise ConflictError(
+                "同一幂等作用域内幂等键已用于不同的业务请求",
+                context={
+                    "idempotency_scope": PROJECT_SCOPE,
+                    "project_code": project_code,
+                    "requested_by": requested_by,
+                    "idempotency_key": key,
+                    "differences": conflict.differences,
+                },
+            ) from None
+
+    @staticmethod
+    def _request_differences(existing: sqlite3.Row, protocol: sqlite3.Row, parameters: dict[str, Any], priority: int) -> list[str]:
+        differences: list[str] = []
+        if existing["protocol_id"] != protocol["id"]:
+            differences.append("protocol_code")
+        if existing["parameter_digest"] != digest(parameters):
+            differences.append("parameters")
+        if int(existing["priority"]) != int(priority):
+            differences.append("priority")
+        return differences
+
+    def _record_submission_audit(
+        self,
+        requested_by: str,
+        project_code: str,
+        key: str,
+        session_id: int | None,
+        *,
+        outcome: str,
+        result: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        metadata: dict[str, Any] = {
+            "idempotency_scope": PROJECT_SCOPE,
+            "project_code": project_code,
+            "requested_by": requested_by,
+            "idempotency_key": key,
+            "result": result,
+        }
+        if extra:
+            metadata.update(extra)
+        self.audit.record(
+            AuditContext(actor_user_id=None, actor_name=requested_by),
+            action="pilot_session.submit",
+            resource_type="pilot_session",
+            resource_id=session_id,
+            outcome=outcome,
+            metadata=metadata,
+        )
 
     def list_sessions(self, *, status: str | None = None, project_code: str | None = None, requested_by: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_sessions(status=status, project_code=project_code, requested_by=requested_by, limit=max(1, min(limit, 500)))

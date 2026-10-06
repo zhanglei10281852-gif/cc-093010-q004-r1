@@ -48,13 +48,37 @@ class PilotRepository:
     def session_by_id(self, session_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT t.*,tpl.code AS protocol_code,tpl.capability AS protocol_capability FROM pilot_sessions t JOIN pilot_protocols tpl ON tpl.id=t.protocol_id WHERE t.id=?", (session_id,)).fetchone()
 
-    def session_by_idempotency(self, requested_by: str, key: str) -> sqlite3.Row | None:
-        return self.connection.execute("SELECT * FROM pilot_sessions WHERE requested_by=? AND idempotency_key=?", (requested_by, key)).fetchone()
+    def session_by_idempotency(self, project_code: str, requested_by: str, key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM pilot_sessions WHERE project_code=? AND requested_by=? AND idempotency_key=?",
+            (project_code, requested_by, key),
+        ).fetchone()
 
-    def create_session(self, *, protocol_id: int, project_code: str, requested_by: str, parameters: dict[str, Any], parameter_digest: str, priority: int, idempotency_key: str, max_attempts: int, now: str) -> dict[str, Any]:
+    def create_session(
+        self,
+        *,
+        protocol_id: int,
+        project_code: str,
+        requested_by: str,
+        parameters: dict[str, Any],
+        parameter_digest: str,
+        request_digest: str,
+        idempotency_scope: str,
+        priority: int,
+        idempotency_key: str,
+        max_attempts: int,
+        now: str,
+    ) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO pilot_sessions(protocol_id,project_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,status,attempt_count,max_attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'queued',0,?,?,?,?)",
-            (protocol_id, project_code, requested_by, json.dumps(parameters, ensure_ascii=False, sort_keys=True), parameter_digest, priority, idempotency_key, max_attempts, now, now, now),
+            "INSERT INTO pilot_sessions(protocol_id,project_code,requested_by,parameters_json,parameter_digest,"
+            "request_digest,idempotency_scope,priority,idempotency_key,status,attempt_count,max_attempts,"
+            "available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',0,?,?,?,?)",
+            (
+                protocol_id, project_code, requested_by,
+                json.dumps(parameters, ensure_ascii=False, sort_keys=True),
+                parameter_digest, request_digest, idempotency_scope, priority, idempotency_key,
+                max_attempts, now, now, now,
+            ),
         )
         return dict(self.session_by_id(cursor.lastrowid))
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -217,31 +219,7 @@ CREATE TABLE IF NOT EXISTS pilot_quotas (
     updated_at TEXT NOT NULL,
     UNIQUE(subject_type, subject_key)
 );
-CREATE TABLE IF NOT EXISTS pilot_sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    protocol_id INTEGER NOT NULL REFERENCES pilot_protocols(id) ON DELETE RESTRICT,
-    project_code TEXT NOT NULL,
-    requested_by TEXT NOT NULL,
-    parameters_json TEXT NOT NULL,
-    parameter_digest TEXT NOT NULL,
-    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
-    idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
-    attempt_count INTEGER NOT NULL DEFAULT 0,
-    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
-    available_at TEXT NOT NULL,
-    lease_owner TEXT NOT NULL DEFAULT '',
-    lease_expires_at TEXT NOT NULL DEFAULT '',
-    current_observation_version INTEGER,
-    last_error_code TEXT NOT NULL DEFAULT '',
-    last_error_message TEXT NOT NULL DEFAULT '',
-    version INTEGER NOT NULL DEFAULT 1,
-    started_at TEXT,
-    finished_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(requested_by, idempotency_key)
-);
+__PILOT_SESSIONS__
 CREATE INDEX IF NOT EXISTS idx_pilot_queue ON pilot_sessions(status,priority DESC,available_at,created_at);
 CREATE TABLE IF NOT EXISTS pilot_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,6 +261,122 @@ PERMISSIONS = [
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
 ]
+
+
+CURRENT_SCHEMA_VERSION = 3
+PROJECT_SCOPE = "project:submitter"
+
+
+PILOT_SESSIONS_TABLE = '''
+CREATE TABLE pilot_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol_id INTEGER NOT NULL REFERENCES pilot_protocols(id) ON DELETE RESTRICT,
+    project_code TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    parameter_digest TEXT NOT NULL,
+    request_digest TEXT NOT NULL DEFAULT '',
+    idempotency_scope TEXT NOT NULL DEFAULT 'project:submitter',
+    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    current_observation_version INTEGER,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(project_code, requested_by, idempotency_key)
+);
+'''
+
+SCHEMA = SCHEMA.replace(
+    "__PILOT_SESSIONS__",
+    PILOT_SESSIONS_TABLE.replace("CREATE TABLE pilot_sessions", "CREATE TABLE IF NOT EXISTS pilot_sessions", 1),
+)
+
+
+def session_request_digest(protocol_code: str, parameters: dict, priority: int) -> str:
+    """场次提交请求的业务指纹：参数、方案与优先级任一变化都会改变摘要。"""
+    payload = {
+        "protocol_code": protocol_code,
+        "parameters": parameters,
+        "priority": int(priority),
+    }
+    compact = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(compact.encode()).hexdigest()
+
+
+def _migrate_2_to_3(connection: sqlite3.Connection) -> None:
+    """场次幂等边界由“提交方+键”收紧为“项目+提交方+键”，并保留请求摘要与实际作用域。
+
+    旧表把 UNIQUE(requested_by, idempotency_key) 内嵌在表定义中，SQLite 只能通过
+    重建表替换该约束；历史行原样保留并回填 request_digest 与作用域后仍可查询。
+    外键开关必须在事务外切换，因此这里显式管理事务边界。
+    """
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(pilot_sessions)").fetchall()}
+    if not columns:
+        connection.execute(PILOT_SESSIONS_TABLE)
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            if "request_digest" not in columns:
+                connection.execute("ALTER TABLE pilot_sessions ADD COLUMN request_digest TEXT NOT NULL DEFAULT ''")
+            if "idempotency_scope" not in columns:
+                connection.execute("ALTER TABLE pilot_sessions ADD COLUMN idempotency_scope TEXT NOT NULL DEFAULT 'project:submitter'")
+            rows = connection.execute(
+                "SELECT s.id,s.parameters_json,tpl.code AS protocol_code,s.priority "
+                "FROM pilot_sessions s JOIN pilot_protocols tpl ON tpl.id=s.protocol_id "
+                "WHERE s.request_digest=''"
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE pilot_sessions SET request_digest=?,idempotency_scope=? WHERE id=?",
+                    (session_request_digest(row["protocol_code"], json.loads(row["parameters_json"]), row["priority"]), PROJECT_SCOPE, row["id"]),
+                )
+            # 重建期间禁止 RENAME 改写子表（观察记录、干预记录）的外键引用
+            connection.execute("PRAGMA legacy_alter_table=ON")
+            connection.execute("ALTER TABLE pilot_sessions RENAME TO pilot_sessions_old")
+            connection.execute(PILOT_SESSIONS_TABLE)
+            connection.execute("PRAGMA legacy_alter_table=OFF")
+            connection.execute(
+                "INSERT INTO pilot_sessions SELECT "
+                "id,protocol_id,project_code,requested_by,parameters_json,parameter_digest,"
+                "request_digest,idempotency_scope,priority,idempotency_key,status,attempt_count,"
+                "max_attempts,available_at,lease_owner,lease_expires_at,current_observation_version,"
+                "last_error_code,last_error_message,version,started_at,finished_at,created_at,updated_at "
+                "FROM pilot_sessions_old"
+            )
+            connection.execute("DROP TABLE pilot_sessions_old")
+            connection.execute("DROP INDEX IF EXISTS idx_pilot_queue")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pilot_queue ON pilot_sessions(status,priority DESC,available_at,created_at)"
+            )
+            violations = connection.execute("PRAGMA foreign_key_check(pilot_sessions)").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError("场次幂等作用域升级后存在外键冲突")
+        except Exception:
+            connection.execute("PRAGMA legacy_alter_table=OFF")
+            connection.execute("ROLLBACK")
+            raise
+        else:
+            connection.execute("COMMIT")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
+MIGRATIONS = {
+    3: _migrate_2_to_3,
+}
 
 
 def database_path() -> Path:
@@ -332,30 +426,43 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
 
 def init_db() -> None:
     now = to_storage(utc_now())
-    with transaction(immediate=True) as connection:
-        connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
-        for code, name, resource, action in PERMISSIONS:
-            connection.execute(
-                "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
-                (code, name, resource, action),
-            )
-        roles = [
-            ("administrator", "系统管理员", "拥有全部系统权限"),
-            ("operator", "试点运营员", "维护目录、场地和体验场次"),
-            ("reviewer", "证据审阅员", "审阅产品证据与体验反馈"),
-            ("auditor", "审计查看员", "只读查看运行与审计记录"),
-        ]
-        for code, name, description in roles:
-            connection.execute(
-                "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES(?,?,?,1,?,?)",
-                (code, name, description, now, now),
-            )
-        administrator = connection.execute("SELECT id FROM roles WHERE code='administrator'").fetchone()[0]
+    connection = get_connection()
+    with transaction(immediate=True) as tx_connection:
+        tx_connection.executescript(SCHEMA)
+        version = int(tx_connection.execute("PRAGMA user_version").fetchone()[0])
+        _seed_permissions_and_roles(tx_connection, now)
+        if version == 0:
+            # 全新数据库直接标记为当前版本，跳过历史迁移
+            tx_connection.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+    if 0 < version < CURRENT_SCHEMA_VERSION:
+        for target in range(version + 1, CURRENT_SCHEMA_VERSION + 1):
+            MIGRATIONS[target](connection)
+        with transaction(immediate=True) as tx_connection:
+            tx_connection.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+
+
+def _seed_permissions_and_roles(connection: sqlite3.Connection, now: str) -> None:
+    for code, name, resource, action in PERMISSIONS:
         connection.execute(
-            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
-            (administrator, now),
+            "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
+            (code, name, resource, action),
         )
+    roles = [
+        ("administrator", "系统管理员", "拥有全部系统权限"),
+        ("operator", "试点运营员", "维护目录、场地和体验场次"),
+        ("reviewer", "证据审阅员", "审阅产品证据与体验反馈"),
+        ("auditor", "审计查看员", "只读查看运行与审计记录"),
+    ]
+    for code, name, description in roles:
+        connection.execute(
+            "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES(?,?,?,1,?,?)",
+            (code, name, description, now, now),
+        )
+    administrator = connection.execute("SELECT id FROM roles WHERE code='administrator'").fetchone()[0]
+    connection.execute(
+        "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
+        (administrator, now),
+    )
 
 
 def migrate_db() -> None:
